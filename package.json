@@ -1,0 +1,28 @@
+{
+   "name": "lastweekingoogle.com",
+   "version": "1.0.0",
+   "description": "Infrastructure and Site for lastweekingoogle.com",
+   "main": "index.js",
+   "scripts": {
+      "test": "echo \"Error: no test specified\" && exit 1"
+   },
+   "repository": {
+      "type": "git",
+      "url": "git+ssh://git@github.com/jthomerson/lastweekingoogle.com.git"
+   },
+   "keywords": [
+      "Last",
+      "Week",
+      "in",
+      "Google"
+   ],
+   "author": "Jeremy Thomerson <jeremy@thomersonfamily.com>",
+   "license": "MIT",
+   "bugs": {
+      "url": "https://github.com/jthomerson/lastweekingoogle.com/issues"
+   },
+   "homepage": "https://github.com/jthomerson/lastweekingoogle.com#readme",
+   "devDependencies": {
+      "@silvermine/serverless-plugin-cloudfront-lambda-edge": "2.1.1"
+   }
+}
