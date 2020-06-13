@@ -1,0 +1,41 @@
+service: lastweekingoogle-dns
+
+custom:
+   defaultRegion: 'us-east-1'
+   # For a real service my default would normally be "dev", or '${env:USER}', but for
+   # these static sites I don't really have a development version and a production
+   # version, so just deploy them straight to PRD.
+   defaultStage: 'prd'
+   region: '${opt:region, self:custom.defaultRegion}'
+   stage: '${opt:stage, self:custom.defaultStage}'
+   objectPrefix: '${self:service}-${self:custom.stage}'
+   withRegionObjectPrefix: '${self:service}-${self:custom.region}-${self:custom.stage}'
+   domain: 'lastweekingoogle.com'
+
+provider:
+   name: aws
+   stackTags: # STAGE is automatically added by SLS
+      SERVICE_NAME: '${self:service}'
+   region: '${self:custom.region}'
+   stage: '${self:custom.stage}'
+   stackPolicy:
+      # Allow all kinds of updates (including delete / replace)
+      - { Effect: 'Allow', Action: 'Update:*', Principal: '*', Resource: '*' }
+      # But don't let the hosted zone get replaced by an update
+      - { Effect: 'Allow', Action: 'Update:Replace', Principal: '*', Resource: 'LogicalResourceId/HostedZone' }
+
+resources:
+   Outputs:
+      HostedZone:
+         Description: The hosted zone for other services to add DNS entries to
+         Value: { Ref: 'HostedZone' }
+         Export:
+            Name: '${self:custom.objectPrefix}-HostedZoneID'
+   Resources:
+      HostedZone:
+         Type: 'AWS::Route53::HostedZone'
+         # In case I do something dumb and accidentally delete the entire stack, still
+         # don't delete the hosted zone.
+         DeletionPolicy: 'Retain'
+         Properties:
+            Name: '${self:custom.domain}'

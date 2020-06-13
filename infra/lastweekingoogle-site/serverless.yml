@@ -1,0 +1,236 @@
+service: lastweekingoogle-site
+
+custom:
+   defaultRegion: 'us-east-1'
+   # For a real service my default would normally be "dev", or '${env:USER}', but for
+   # these static sites I don't really have a development version and a production
+   # version, so just deploy them straight to PRD.
+   defaultStage: 'prd'
+   region: '${opt:region, self:custom.defaultRegion}'
+   stage: '${opt:stage, self:custom.defaultStage}'
+   objectPrefix: '${self:service}-${self:custom.stage}'
+   withRegionObjectPrefix: '${self:service}-${self:custom.region}-${self:custom.stage}'
+   domain: 'lastweekingoogle.com'
+
+plugins:
+   - '@silvermine/serverless-plugin-cloudfront-lambda-edge'
+
+package:
+   exclude:
+      - 'node_modules/**'
+      - '*.yml'
+
+provider:
+   name: aws
+   runtime: nodejs12.x
+   stackTags: # STAGE is automatically added by SLS
+      SERVICE_NAME: '${self:service}'
+   region: '${self:custom.region}'
+   stage: '${self:custom.stage}'
+   stackPolicy:
+      # Allow all kinds of updates (including delete / replace)
+      - { Effect: 'Allow', Action: 'Update:*', Principal: '*', Resource: '*' }
+      # But don't let the certificate or the CloudFront distributions get replaced by an update
+      -
+         Effect: 'Allow'
+         Action: 'Update:Replace'
+         Principal: '*'
+         Resource:
+            - 'LogicalResourceId/WebsiteCertificate'
+            - 'LogicalResourceId/WebsiteDistribution'
+            - 'LogicalResourceId/WWWRedirectDistribution'
+
+functions:
+   # Handles requests to lastweekingoogle.com/{any-folder}/ - rewriting the request to the
+   # origin (S3 bucket) to include "index.html" so that the request becomes
+   # s3-bucket-origin.com/{any-folder}/index.html. Works at any folder depth.
+   directoryRootRewriter:
+      name: '${self:custom.objectPrefix}-directory-root-rewriter'
+      handler: 'src/DirectoryRootRewriteHandler.handler'
+      memorySize: 128
+      timeout: 1
+      lambdaAtEdge:
+         distribution: 'WebsiteDistribution'
+         eventType: 'viewer-request'
+   # Used by a separate CloudFront distribution to catch all requests to
+   # www.lastweekingoogle.com and redirect them to the desired domain -
+   # lastweekingoogle.com.
+   #
+   # This could be accomplished by means of a single CloudFront distribution that responds
+   # to requests for both lastweekingoogle.com and www.lastweekingoogle.com. However, this
+   # redirect functionality needs to be handled by means of a "viewer-request" function,
+   # because it's only at the viewer-request that we have the actual hostname that the
+   # user requested - by the time we get to an origin-request function, the host header
+   # has been rewritten (by CloudFront) to the domain name for the origin (the S3 bucket
+   # domain). Using a viewer-request function on a single combined distribution handling
+   # both the primary and alternate domains would mean that _every request to either
+   # domain_, including all requests for static assets like CSS, JS, images, et cetera
+   # invokes the function. This results in far more Lambda@Edge invocations than an
+   # origin-request function would (because origin requests are only made for CloudFront
+   # cache _misses_, and not for _hits_). Thus, we save a significant number of
+   # invocations (and thus some dollars and cents) by splitting the distribution into two:
+   # the one that has the origin-request handler shown above - for handling directory
+   # default documents - and this one, which has a viewer-request function that only gets
+   # invoked when someone requests something directly from the alternate domain, which is
+   # likely a single request made by a browser for a page from some old link that links to
+   # www.lastweekingoogle.com - from before the domain was migrated to the apex.
+   wwwRedirector:
+      name: '${self:custom.objectPrefix}-www-redirector'
+      handler: src/RedirectToDesiredDomainHandler.handler
+      memorySize: 128
+      timeout: 1
+      lambdaAtEdge:
+         distribution: 'WWWRedirectDistribution'
+         eventType: 'viewer-request'
+
+resources:
+   Resources:
+      WebsiteBucket:
+         Type: 'AWS::S3::Bucket'
+         # In case I do something dumb and accidentally delete the entire stack, still
+         # don't delete the bucket.
+         DeletionPolicy: 'Retain'
+         Properties:
+            BucketName: '${self:custom.objectPrefix}'
+            AccessControl: 'BucketOwnerFullControl'
+            PublicAccessBlockConfiguration:
+               BlockPublicAcls: true
+               BlockPublicPolicy: true
+               IgnorePublicAcls: true
+               RestrictPublicBuckets: true
+      # This is a CloudFront origin access identity, which allows CloudFront to read from
+      # the S3 bucket.
+      CloudFrontOAI:
+         Type: 'AWS::CloudFront::CloudFrontOriginAccessIdentity'
+         Properties:
+            CloudFrontOriginAccessIdentityConfig:
+               Comment: '${self:custom.objectPrefix}'
+      # This bucket policy now grants access to the one user that CloudFront uses to
+      # access the bucket (the CloudFront "Origin Access Identity" created above).
+      WebsiteBucketPolicy:
+         Type: 'AWS::S3::BucketPolicy'
+         Properties:
+            Bucket: { Ref: 'WebsiteBucket' }
+            PolicyDocument:
+               Statement:
+                  -
+                     Effect: 'Allow'
+                     Action: 's3:GetObject'
+                     Resource: { 'Fn::Join': [ '', [ 'arn:aws:s3:::', { Ref: 'WebsiteBucket' }, '/*' ] ] }
+                     Principal:
+                        CanonicalUser: { 'Fn::GetAtt': [ 'CloudFrontOAI', 'S3CanonicalUserId' ] }
+      # This is the actual distribution that services the website lastweekingoogle.com
+      WebsiteDistribution:
+         Type: 'AWS::CloudFront::Distribution'
+         Properties:
+            DistributionConfig:
+               DefaultCacheBehavior:
+                  AllowedMethods:
+                     - 'HEAD'
+                     - 'GET'
+                  TargetOriginId: 'WebsiteBucketOrigin'
+                  ViewerProtocolPolicy: 'redirect-to-https'
+                  DefaultTTL: 600 # ten minutes
+                  MaxTTL: 600 # ten minutes
+                  Compress: true
+                  ForwardedValues:
+                     QueryString: false
+                     Cookies: { Forward: 'none' }
+               DefaultRootObject: 'index.html'
+               Enabled: true
+               PriceClass: 'PriceClass_100'
+               HttpVersion: 'http2'
+               Aliases:
+                  - '${self:custom.domain}'
+               ViewerCertificate:
+                  AcmCertificateArn: { Ref: 'WebsiteCertificate' }
+                  SslSupportMethod: 'sni-only'
+               Origins:
+                  -
+                     Id: 'WebsiteBucketOrigin'
+                     DomainName: { 'Fn::GetAtt': [ 'WebsiteBucket', 'DomainName' ] } # This returns the REST endpoint
+                     S3OriginConfig:
+                        OriginAccessIdentity:
+                           'Fn::Join': [ '/', [ 'origin-access-identity/cloudfront', { Ref: 'CloudFrontOAI' } ] ]
+      # This distribution just serves www.lastweekingoogle.com, which redirects to
+      # lastweekingoogle.com. See the long comment on the functions above to understand
+      # why we use two distributions for this. Short answer: Save $$$.
+      WWWRedirectDistribution:
+         Type: 'AWS::CloudFront::Distribution'
+         Properties:
+            DistributionConfig:
+               DefaultCacheBehavior:
+                  AllowedMethods:
+                     - 'HEAD'
+                     - 'GET'
+                  TargetOriginId: 'WebsiteBucketOrigin'
+                  ViewerProtocolPolicy: 'redirect-to-https'
+                  DefaultTTL: 86400 # one day (which is CloudFormation default as well)
+                  MaxTTL: 86400 # one day
+                  Compress: true
+                  ForwardedValues:
+                     QueryString: false
+                     Cookies: { Forward: 'none' }
+               DefaultRootObject: 'index.html'
+               Enabled: true
+               PriceClass: 'PriceClass_100'
+               HttpVersion: 'http2'
+               Aliases:
+                  - 'www.${self:custom.domain}'
+               ViewerCertificate:
+                  AcmCertificateArn: { Ref: 'WebsiteCertificate' }
+                  SslSupportMethod: 'sni-only'
+               Origins:
+                  -
+                     # Technically, this origin won't be used because we redirect all
+                     # requests to the apex (no-www) version of the site.
+                     Id: 'WebsiteBucketOrigin'
+                     DomainName: { 'Fn::GetAtt': [ 'WebsiteBucket', 'DomainName' ] } # This returns the REST endpoint
+                     S3OriginConfig:
+                        OriginAccessIdentity:
+                           'Fn::Join': [ '/', [ 'origin-access-identity/cloudfront', { Ref: 'CloudFrontOAI' } ] ]
+      # We use one certificate to handle both the apex (lastweekingoogle.com) as well as
+      # the www.lastweekingoogle.com site.
+      WebsiteCertificate:
+         Type: 'AWS::CertificateManager::Certificate'
+         Properties:
+            DomainName: '${self:custom.domain}'
+            SubjectAlternativeNames:
+               - 'www.${self:custom.domain}'
+            # This certificate gets automatically validated because we point it to a
+            # Route53 hosted zone (see the lastweekingoogle-dns service for that hosted
+            # zone). This is an awesome new feature of CloudFormation, released on 
+            # June 12, 2020. See https://amzn.to/2XWyEjD
+            ValidationMethod: 'DNS'
+            DomainValidationOptions:
+               # It seems that you must list each domain that will be on the certificate
+               # in order for the DNS validation to work. Using email validation, you
+               # could list just the "parent" domain, which would work for both that and
+               # the www "child" domain. Thus, here we list both the primary domain as
+               # well as the www subdomain with their own validation options, both
+               # pointing to the hosted zone ID so that CloudFormation will insert the
+               # necessary CNAME values to validate the certs for us.
+               -
+                  DomainName: '${self:custom.domain}'
+                  HostedZoneId: { 'Fn::ImportValue': 'lastweekingoogle-dns-${self:custom.stage}-HostedZoneID' }
+               -
+                  DomainName: 'www.${self:custom.domain}'
+                  HostedZoneId: { 'Fn::ImportValue': 'lastweekingoogle-dns-${self:custom.stage}-HostedZoneID' }
+      ApexRecordSet:
+         Type: 'AWS::Route53::RecordSet'
+         Properties:
+            Type: 'A'
+            Name: '${self:custom.domain}'
+            HostedZoneId: { 'Fn::ImportValue': 'lastweekingoogle-dns-${self:custom.stage}-HostedZoneID' }
+            AliasTarget:
+               DNSName: { 'Fn::GetAtt': [ 'WebsiteDistribution', 'DomainName' ] }
+               HostedZoneId: 'Z2FDTNDATAQYW2' # see https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-route53-aliastarget.html
+      WWWRecordSet:
+         Type: 'AWS::Route53::RecordSet'
+         Properties:
+            Type: 'A'
+            Name: 'www.${self:custom.domain}'
+            HostedZoneId: { 'Fn::ImportValue': 'lastweekingoogle-dns-${self:custom.stage}-HostedZoneID' }
+            AliasTarget:
+               DNSName: { 'Fn::GetAtt': [ 'WWWRedirectDistribution', 'DomainName' ] }
+               HostedZoneId: 'Z2FDTNDATAQYW2' # see https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-route53-aliastarget.html
